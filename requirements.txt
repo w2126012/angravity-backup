@@ -1,0 +1,8 @@
+opencv-python
+numpy
+pyobjc-framework-Quartz
+pyobjc-framework-Cocoa
+pyautogui
+pytesseract
+Pillow
+pyperclip

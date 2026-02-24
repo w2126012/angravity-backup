@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>WeCom 自动回复流程图</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            padding: 20px; 
+            background: #f5f5f5;
+        }
+        h1 { text-align: center; }
+        .mermaid { 
+            background: white; 
+            padding: 20px; 
+            border-radius: 10px;
+            overflow: auto;
+        }
+        .zoom-controls {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        button { 
+            font-size: 20px; 
+            padding: 10px 20px; 
+            margin: 5px; 
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="zoom-controls">
+        <button onclick="zoom(1.2)">放大 +</button>
+        <button onclick="zoom(0.8)">缩小 -</button>
+        <button onclick="resetZoom()">重置</button>
+    </div>
+    
+    <h1>WeCom 自动回复系统 - 详细流程图</h1>
+    
+    <div class="mermaid" id="diagram">
+flowchart TD
+    subgraph 主循环
+        START[开始] --> LOOP[循环迭代]
+    end
+    
+    subgraph STEP0[STEP 0: 窗口截图]
+        LOOP --> S0_1[screencapture 企微窗口]
+        S0_1 --> S0_2[模板匹配IT服务工单图标]
+        S0_2 --> S0_CHK{找到图标?}
+        S0_CHK -->|否| WAIT5[等待5秒] --> LOOP
+    end
+    
+    subgraph 激活企微
+        S0_CHK -->|是| ACT[open -a 企业微信]
+        ACT --> ACT_WAIT[等待0.3秒]
+    end
+    
+    subgraph STEP3[STEP 3: 外部系统检测]
+        ACT_WAIT --> S3_1[全屏截图 OCR]
+        S3_1 --> S3_3{外部系统 AND 非企微聊天?}
+        S3_3 -->|是| S3_4[Cmd+W 关闭]
+        S3_4 --> S3_5[重新激活企微]
+        S3_3 -->|否| STEP4
+        S3_5 --> STEP4
+    end
+    
+    subgraph STEP45[STEP 4-5: 工作台检测]
+        STEP4 --> S4_1[截取企微窗口 OCR]
+        S4_1 --> S5_2{工作台关键词>=2?}
+        S5_2 -->|是| S5_3[Cmd+W 关闭工作台]
+        S5_2 -->|否| STEP1
+        S5_3 --> STEP1
+    end
+    
+    subgraph STEP1[STEP 1: 红点检测]
+        STEP1 --> S1_1{冷却期30秒内?}
+        S1_1 -->|是| LOOP
+        S1_1 -->|否| S1_2{检测到红点?}
+        S1_2 -->|否| WAIT5_2[等待5秒] --> LOOP
+        S1_2 -->|是| S1_3[记录红点]
+    end
+    
+    subgraph STEP2[STEP 2: 点击图标]
+        S1_3 --> S2_1[计算坐标]
+        S2_1 --> S2_3{边界检查OK?}
+        S2_3 -->|否| COOLDOWN[设置冷却期] --> LOOP
+        S2_3 -->|是| S2_4[点击图标]
+    end
+    
+    subgraph STEP6[STEP 6: 验证聊天]
+        S2_4 --> S6_1[OCR验证聊天列表]
+        S6_1 --> S6_5{在IT服务工单聊天?}
+        S6_5 -->|否| COOLDOWN2[设置冷却期] --> LOOP
+        S6_5 -->|是| CC_1[点击聊天内容 80%]
+    end
+    
+    subgraph OCR工单[OCR工单信息]
+        CC_1 --> CC_2[Cmd+Down 滚动]
+        CC_2 --> OT_1[OCR抓取工单]
+        OT_1 --> OT_2{匹配: 人名 添加了 ID?}
+        OT_2 -->|否| COOLDOWN4[设置冷却期] --> LOOP
+        OT_2 -->|是| VD_1[点击查看详情 75%]
+    end
+    
+    subgraph 回复[回复稍等]
+        VD_1 --> VD_2[等待10秒]
+        VD_2 --> R_2[粘贴发送 稍等]
+        R_2 --> R_4[设置冷却期] --> LOOP
+    end
+    </div>
+
+    <script>
+        mermaid.initialize({ 
+            startOnLoad: true,
+            theme: 'default',
+            flowchart: { 
+                curve: 'basis',
+                nodeSpacing: 50,
+                rankSpacing: 50
+            }
+        });
+        
+        let currentScale = 1;
+        const diagram = document.getElementById('diagram');
+        
+        function zoom(factor) {
+            currentScale *= factor;
+            diagram.style.transform = `scale(${currentScale})`;
+            diagram.style.transformOrigin = 'top left';
+        }
+        
+        function resetZoom() {
+            currentScale = 1;
+            diagram.style.transform = 'scale(1)';
+        }
+    </script>
+</body>
+</html>

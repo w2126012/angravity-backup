@@ -1,0 +1,549 @@
+
+import time
+import cv2
+import logging
+import subprocess
+from utils.window_capture import WindowCapture
+from utils.image_processor import ImageProcessor
+from utils.automation import AutomationController
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def main():
+    logger.info("Starting WeCom AutoReply Service (Final Version)...")
+    
+    # Initialize components
+    monitor = WindowCapture(window_name="企业微信")
+    vision = ImageProcessor()  # Text-based detection, no templates needed
+    bot = AutomationController()
+    
+    # State: Deduplication Set
+    processed_tickets = set()
+    
+    # Metrics
+    loop_count = 0
+    
+    # Main Loop
+    while True:
+        try:
+            loop_count += 1
+            if loop_count % 30 == 0:
+                logger.info(f"Monitor running... (Iteration {loop_count}) | Processed IDs: {len(processed_tickets)}")
+
+
+            # 1. Activate WeCom window before each detection
+            # This ensures the window is always in front for reliable detection
+            if loop_count == 1 or loop_count % 5 == 0:  # Activate on first loop and every 5 iterations (10 seconds)
+                logger.debug("激活企业微信窗口...")
+                bot.activate_window("企业微信")
+                time.sleep(1.0)  # Wait for window to fully activate
+                
+                # Loop to close workbench/ticket pages until we reach WeCom chat interface
+                max_retries = 5
+                for retry in range(max_retries):
+                    # Take a quick screenshot to detect current page type
+                    try:
+                        import subprocess
+                        import pytesseract
+                        quick_screenshot_path = "debug_quick_check.png"
+                        subprocess.run(['screencapture', '-x', quick_screenshot_path], check=True, timeout=2)
+                        time.sleep(0.2)
+                        quick_frame = cv2.imread(quick_screenshot_path)
+                        
+                        if quick_frame is not None:
+                            # OCR to detect page type
+                            ocr_text = pytesseract.image_to_string(quick_frame, lang='chi_sim')
+                            
+                            # Keywords for workbench/ticket pages (should close)
+                            workbench_keywords = ['工作台', '工单系统', '我的工单', '待办', '审批', '查看详情', '分布给我的消息']
+                            is_on_workbench = any(keyword in ocr_text for keyword in workbench_keywords)
+                            
+                            # Keywords for WeCom chat interface (good, stop retrying)
+                            chat_list_keywords = ['IT服务工单', '消息', '通讯录', '文档', '日历']
+                            is_chat_interface = any(keyword in ocr_text for keyword in chat_list_keywords)
+                            
+                            if is_chat_interface and not is_on_workbench:
+                                # Successfully reached WeCom chat interface
+                                logger.info(f"✓ 已到达企微聊天界面 (重试{retry}次)")
+                                break
+                            elif is_on_workbench:
+                                # Still on workbench/ticket page, close it
+                                logger.info(f"检测到工作台/工单页 (第{retry+1}次),执行Cmd+W关闭...")
+                                import pyautogui
+                                # Switch to English input method
+                                subprocess.run(['osascript', '-e', 'tell application "System Events" to key code 49 using control down'], check=False)
+                                time.sleep(0.2)
+                                # Execute Cmd+W
+                                pyautogui.hotkey('command', 'w')
+                                time.sleep(0.5)
+                                # Re-activate WeCom window
+                                bot.activate_window("企业微信")
+                                time.sleep(0.5)
+                                # Continue to next retry
+                            else:
+                                # Unknown page, assume it's okay
+                                logger.debug(f"未检测到明确页面类型 (重试{retry}次),继续...")
+                                break
+                        else:
+                            logger.debug(f"截图读取失败 (重试{retry}次)")
+                            break
+                            
+                    except Exception as e:
+                        logger.debug(f"页面检测错误 (重试{retry}次): {e}")
+                        break
+
+            # 2. Capture using screencapture command (more reliable than Quartz)
+            screenshot_path = "debug_current_vision.png"
+            try:
+                subprocess.run(['screencapture', '-x', screenshot_path], check=True, timeout=2)
+                time.sleep(0.2)
+                frame = cv2.imread(screenshot_path)
+                if frame is None:
+                    logger.warning("Failed to read screenshot")
+                    time.sleep(2)
+                    continue
+            except Exception as e:
+                logger.error(f"Screenshot failed: {e}")
+                time.sleep(2)
+                continue
+
+
+            # 3. Find "IT服务工单" and detect its state
+            chat_rect, is_active, has_red_dot = vision.find_chat_with_state(frame, "IT服务工单")
+            
+            if not chat_rect:
+                # Chat not found - might be scrolled away
+                logger.debug("IT服务工单 chat not found")
+                time.sleep(120)
+                continue
+            
+            # 4. Determine if we should click based on state
+            should_click = False
+            should_process = False
+            
+            if not is_active and has_red_dot:
+                # White background + red dot → Click to enter chat
+                logger.info("=" * 60)
+                logger.info("🔴 检测到红点通知!")
+                logger.info("📍 状态: 聊天未激活")
+                logger.info("👆 操作: 点击进入聊天")
+                logger.info("=" * 60)
+                should_click = True
+                should_process = True
+            elif is_active and has_red_dot:
+                # Blue background + red dot → Already in chat with new message
+                logger.info("=" * 60)
+                logger.info("🔴 检测到红点通知!")
+                logger.info("📍 状态: 聊天已激活")
+                logger.info("👆 操作: 直接检测工单(无需点击)")
+                logger.info("=" * 60)
+                should_click = False
+                should_process = True
+            else:
+                # No red dot → Skip (don't process old messages)
+                logger.debug("无红点通知 - 跳过")
+                time.sleep(120)
+                continue
+            
+            # 5. Click to enter chat if needed
+            if should_click:
+                x, y, w, h = chat_rect
+                text_center_x = x + w // 2
+                text_center_y = y + h // 2
+                
+                # Since we use screencapture (full screen), coordinates are already absolute
+                # No need to convert from window-relative to screen coordinates  
+                click_x = text_center_x
+                click_y = text_center_y
+                
+                logger.info(f"已点击聊天位置 ({click_x}, {click_y})")
+                
+                # Activate and click
+                if bot.activate_window():
+                    time.sleep(0.5)
+                    
+                    import pyautogui
+                    
+                    # First, click the chat to enter
+                    pyautogui.click(click_x, click_y)
+                    logger.info(f"已点击聊天位置 ({click_x}, {click_y})")
+                    time.sleep(1)  # Wait for chat to load
+                    
+                    # Now verify we're actually in chat list (not workbench)
+                    logger.info("验证是否在聊天列表...")
+                    
+                    # Try up to 10 times to get to chat list
+                    max_attempts = 10
+                    in_chat_list = False
+                    
+                    for attempt in range(max_attempts):
+                        # Use system screenshot + OCR to detect if we're on workbench
+                        import os
+                        import pytesseract
+                        
+                        screenshot_path = "debug_system_screenshot.png"
+                        is_on_workbench = False  # Assume not on workbench unless detected
+                        
+                        try:
+                            # Capture system screenshot
+                            subprocess.run(['screencapture', '-x', screenshot_path], check=True, timeout=2)
+                            time.sleep(0.5)
+                            
+                            if os.path.exists(screenshot_path):
+                                screenshot = cv2.imread(screenshot_path)
+                                
+                                if screenshot is not None:
+                                    # Crop to WeCom window area
+                                    # win_bounds = monitor.window_bounds
+                                    # win_x = int(win_bounds.get('X', 0))
+                                    # win_y = int(win_bounds.get('Y', 0))
+                                    # win_w = int(win_bounds.get('Width', 1009))
+                                    # win_h = int(win_bounds.get('Height', 666))
+                                    
+                                    scale = monitor.scale_factor
+                                    # crop_x = int(win_x * scale)
+                                    # crop_x = int(win_x * scale)
+                                    # crop_y = int(win_y * scale)
+                                    # crop_w = int(win_w * scale)
+                                    # crop_h = int(win_h * scale)
+                                    
+                                    # if crop_x + crop_w <= screen_w and crop_y + crop_h <= screen_h:
+                                    #     window_screenshot = screenshot[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+                                    #     cv2.imwrite("debug_current_comparison.png", window_screenshot)
+                                    #     time.sleep(0.5)
+                                        
+                                    #     # OCR the window to detect workbench keywords
+                                    #     ocr_text = pytesseract.image_to_string(window_screenshot, lang='chi_sim')
+                                    
+                                    pass  # Placeholder
+                                    
+                                    pass  # Placeholder - workbench verification code commented out
+                                    
+                                    # # Check for workbench-specific keywords
+                                    # workbench_keywords = [
+                                    #     '基本信息', '跟进记录', '工单列表', '工单管理',
+                                    #     '待处理', '处理中', '待审批', '提交时间', '转交时间',
+                                    #     '问题已解决', '项目模块', '物资履约系统'
+                                    # ]
+                                    # is_on_workbench = any(kw in ocr_text for kw in workbench_keywords)
+                                    
+                                    # if is_on_workbench:
+                                    #     logger.info(f"检测到工作台页面 - 尝试 {attempt + 1}/{max_attempts}")
+                                    # else:
+                                    #     logger.info(f"✓ 已在聊天列表 (尝试 {attempt + 1}/{max_attempts})")
+                                    #     in_chat_list = True
+                                    #     break
+                        except Exception as e:
+                            logger.warning(f"验证失败: {e}")
+                            # On error, assume we're in chat list to avoid false Cmd+W
+                            in_chat_list = True
+                            break
+                        
+                        # ONLY Cmd+W if EXPLICITLY detected on workbench
+                        if is_on_workbench and attempt < max_attempts - 1:
+                            # Step 1: Activate WeCom twice before Cmd+W
+                            logger.info("激活企业微信窗口 (确保前台)...")
+                            bot.activate_window()
+                            time.sleep(0.3)
+                            bot.activate_window()
+                            time.sleep(0.3)
+                            
+                            # Step 2: Execute Cmd+W to close workbench (use AppleScript to avoid input method issues)
+                            logger.info(f"执行 Cmd+W 关闭工作台...")
+                            script = '''
+                                tell application "System Events"
+                                    keystroke "w" using command down
+                                end tell
+                            '''
+                            subprocess.run(['osascript', '-e', script])
+                            time.sleep(1.0)
+                            
+                            # Step 3: Re-activate WeCom after Cmd+W
+                            logger.info("重新激活企业微信...")
+                            bot.activate_window()
+                            time.sleep(0.5)
+                        elif not is_on_workbench and not in_chat_list:
+                            # Not on workbench but also not confirmed in chat - try again
+                            logger.info("未确认位置,重试...")
+                            time.sleep(0.5)
+                        elif is_on_workbench and attempt >= max_attempts - 1:
+                            logger.warning("⚠️  多次尝试后仍在工作台")
+                            logger.info("提示: 请手动关闭工作台页面")
+                            time.sleep(120)
+                            continue
+                    
+                    if not in_chat_list:
+                        time.sleep(120)
+                        continue
+                    
+                    # Now in chat list, continue with scroll and capture
+                    # Click on chat content area to give focus before scrolling
+                    logger.info("点击聊天内容区域获取焦点...")
+                    # win_bounds = monitor.window_bounds
+                    # win_x = win_bounds.get('X', 0)
+                    # win_y = win_bounds.get('Y', 0)
+                    # win_w = win_bounds.get('Width', 1009)
+                    # win_h = win_bounds.get('Height', 666)
+                    
+                    # chat_focus_x = win_x + win_w * 0.7
+                    # chat_focus_y = win_y + win_h * 0.5
+                    # pyautogui.click(chat_focus_x, chat_focus_y)
+                    time.sleep(0.3)
+                    
+                    # Scroll down to see latest messages
+                    logger.info("滚动到最新消息...")
+                    pyautogui.scroll(-5)
+                    time.sleep(0.5)
+                    
+                    # Capture fresh frame after scrolling
+                    frame = monitor.capture()
+                    time.sleep(0.5)
+                    
+
+            
+            # 6. Validate ticket format and display captured information
+            logger.info("=" * 60)
+            logger.info("📋 正在抓取最新工单信息...")
+            is_valid, ticket_id, person_name = vision.validate_ticket_format(frame)
+            
+            if not is_valid:
+                logger.warning("❌ 未找到有效工单格式")
+                logger.info("   要求格式: [人名] 添加了 [数字ID]")
+                logger.info("=" * 60)
+                time.sleep(120)
+                continue
+            
+            # Display captured ticket information
+            logger.info("✅ 成功抓取工单信息:")
+            logger.info(f"   👤 提交人: {person_name}")
+            logger.info(f"   🎫 工单ID: {ticket_id}")
+            logger.info("=" * 60)
+            
+            # 7. Check if already processed
+            if ticket_id in processed_tickets:
+                logger.warning(f"⚠️  工单 {ticket_id} 已处理过 - 跳过")
+                time.sleep(120)
+                continue
+            
+            logger.info(f"🆕 新工单: {person_name} 添加了 {ticket_id}")
+            
+            # 8. Find and click "查看详情" button using system screenshot
+            
+            # Activate WeCom window
+            logger.info("激活企业微信窗口...")
+            bot.activate_window()
+            time.sleep(0.8)
+            
+            # Scroll chat to bottom to ensure "查看详情" button is visible
+            logger.info("滚动聊天到底部...")
+            # win_x = int(monitor.window_bounds.get('X', 0))
+            # win_y = int(monitor.window_bounds.get('Y', 0))
+            # win_w = int(monitor.window_bounds.get('Width', 1000))
+            # win_h = int(monitor.window_bounds.get('Height', 600))
+            
+            # Click in chat area to get focus
+            # chat_x = win_x + int(win_w * 0.7)
+            # chat_y = win_y + int(win_h * 0.5)
+            pyautogui.click(chat_x, chat_y)
+            time.sleep(0.3)
+            
+            # Scroll down multiple times
+            for _ in range(5):
+                pyautogui.scroll(-3)
+                time.sleep(0.1)
+            logger.info("已滚动到聊天底部")
+            time.sleep(0.5)
+            
+            screenshot_path = "debug_button_detect.png"
+            subprocess.run(['screencapture', '-x', screenshot_path], check=True, timeout=2)
+            time.sleep(0.3)
+            
+            screenshot = cv2.imread(screenshot_path)
+            
+            if screenshot is None:
+                logger.warning("截图加载失败 - 跳过")
+                time.sleep(120)
+                continue
+            
+            # Crop to WeCom window area
+            # win_bounds = monitor.window_bounds
+            # win_x = int(win_bounds.get('X', 0))
+            # win_y = int(win_bounds.get('Y', 0))
+            # win_w = int(win_bounds.get('Width', 1009))
+            # win_h = int(win_bounds.get('Height', 666))
+            scale = monitor.scale_factor
+            
+            # crop_x = int(win_x * scale)
+            # crop_y = int(win_y * scale)
+            # crop_w = int(win_w * scale)
+            # crop_h = int(win_h * scale)
+            
+            screen_h, screen_w = screenshot.shape[:2]
+            # if crop_x + crop_w > screen_w or crop_y + crop_h > screen_h:
+                logger.warning("窗口超出屏幕范围 - 跳过")
+                time.sleep(120)
+                continue
+            
+            # window_img = screenshot[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+            
+            # Search for button in right side of window using OCR
+            h, w = window_img.shape[:2]
+            chat_x = int(w * 0.4)
+            chat_roi = window_img[:, chat_x:]
+            
+            # Save original chat ROI for debugging
+            cv2.imwrite('debug_chat_roi_original.png', chat_roi)
+            logger.debug("已保存原始聊天区域: debug_chat_roi_original.png")
+            
+            # Preprocess image for better OCR
+            # 1. Convert to grayscale
+            gray = cv2.cvtColor(chat_roi, cv2.COLOR_BGR2GRAY)
+            
+            # 2. Apply binary threshold to enhance text
+            _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+            
+            # 3. Scale up 2x for better OCR accuracy
+            scaled = cv2.resize(binary, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+            
+            # Save preprocessed image for debugging
+            cv2.imwrite('debug_chat_roi_preprocessed.png', scaled)
+            logger.debug("已保存预处理后的聊天区域: debug_chat_roi_preprocessed.png")
+            
+            # Use OCR to find "查看详情" text with custom config
+            import pytesseract
+            custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
+            ocr_data = pytesseract.image_to_data(scaled, lang='chi_sim', 
+                                                  config=custom_config,
+                                                  output_type=pytesseract.Output.DICT)
+            
+            # Debug: Log all detected text
+            all_texts = [(ocr_data['text'][i], ocr_data['conf'][i]) 
+                        for i in range(len(ocr_data['text'])) 
+                        if ocr_data['text'][i].strip()]
+            logger.debug(f"OCR检测到的所有文字 (共{len(all_texts)}个): {all_texts[:20]}")  # Show first 20
+            
+            # Search for "查看详情" in OCR results
+            button_found = False
+            btn_x_in_window = 0
+            btn_y_in_window = 0
+            
+            for i, text in enumerate(ocr_data['text']):
+                # More flexible matching: look for individual keywords
+                if '查看详情' in text or '查看' in text or '详情' in text or '查' in text or '详' in text:
+                    x = ocr_data['left'][i]
+                    y = ocr_data['top'][i]
+                    w_text = ocr_data['width'][i]
+                    h_text = ocr_data['height'][i]
+                    conf = ocr_data['conf'][i]
+                    
+                    logger.debug(f"找到候选文字 '{text}', 置信度={conf}, 位置=({x}, {y})")
+                    
+                    # Lower confidence threshold to 10 for better detection
+                    if conf > 10:
+                        # Since image was scaled 2x, divide coordinates by 2
+                        actual_x = x // 2
+                        actual_y = y // 2
+                        actual_w = w_text // 2
+                        actual_h = h_text // 2
+                        
+                        # Calculate button center in window coordinates
+                        btn_x_in_window = chat_x + actual_x + actual_w // 2
+                        btn_y_in_window = actual_y + actual_h // 2
+                        button_found = True
+                        logger.info(f"✓ OCR找到'查看详情'关键词: '{text}', 置信度={conf}, 位置=({btn_x_in_window}, {btn_y_in_window})")
+                        break
+            
+            if not button_found:
+                logger.warning("查看详情 按钮未找到 (OCR未检测到) - 跳过")
+                logger.warning(f"请检查调试图像: debug_chat_roi_original.png 和 debug_chat_roi_preprocessed.png")
+                time.sleep(120)
+                continue
+            
+            # Convert to screen coordinates
+            # btn_click_x = win_x + btn_x_in_window / scale
+            # btn_click_y = win_y + btn_y_in_window / scale
+            
+            logger.info(f"按钮位置(窗口内): ({btn_x_in_window}, {btn_y_in_window})")
+            logger.info(f"点击坐标(屏幕): ({btn_click_x:.1f}, {btn_click_y:.1f})")
+            
+            # First activate window
+            bot.activate_window()
+            time.sleep(0.3)
+            
+            # Click button
+            import pyautogui
+            pyautogui.click(btn_click_x, btn_click_y)
+            logger.info(f"Clicked 查看详情 button at ({btn_click_x:.1f}, {btn_click_y:.1f})")
+            
+            # 9. Wait for workbench page to load
+            logger.info("等待工单页面加载...")
+            time.sleep(10)
+            
+            # 10. In workbench page, click input area on right side and type reply
+            # Based on debug_gongdan_massage1.png, input is at bottom-right
+            # win_x = monitor.window_bounds.get('X', 0)
+            # win_y = monitor.window_bounds.get('Y', 0)
+            # win_w = monitor.window_bounds.get('Width', 1009)
+            # win_h = monitor.window_bounds.get('Height', 666)
+            
+            # Input area is in the right panel, near bottom
+            # Right panel starts at about 55% of width, input at about 85% height
+            # input_x = win_x + win_w * 0.75
+            # input_y = win_y + win_h * 0.85
+            
+            logger.info(f"点击工单页面输入框: ({input_x}, {input_y})")
+            pyautogui.click(input_x, input_y)
+            time.sleep(0.5)
+            
+            # Type and send reply
+            import pyperclip
+            pyperclip.copy("请稍后")
+            
+            # Paste with Cmd+V
+            with pyautogui.hold('command'):
+                pyautogui.press('v')
+            
+            time.sleep(0.5)
+            
+            # Send with Enter
+            pyautogui.press('enter')
+            
+            logger.info(f"Sent reply '请稍后' for ticket {ticket_id}")
+            
+            # 11. Close workbench page with Cmd+W to return to chat
+            logger.info("关闭工单页面返回聊天...")
+            time.sleep(1)
+            pyautogui.hotkey('command', 'w')
+            time.sleep(2)
+            
+            # 12. Re-click IT服务工单 chat to re-enter
+            logger.info("重新进入IT服务工单聊天...")
+            x, y, w, h = chat_rect
+            text_center_x = x + w // 2
+            text_center_y = y + h // 2
+            scale = monitor.scale_factor
+            # win_x = monitor.window_bounds.get('X', 0)
+            # win_y = monitor.window_bounds.get('Y', 0)
+            # click_x = win_x + text_center_x / scale
+            # click_y = win_y + text_center_y / scale
+            pyautogui.click(click_x, click_y)
+            time.sleep(1)
+            
+            # 13. Mark as processed
+            processed_tickets.add(ticket_id)
+            logger.info(f"Ticket {ticket_id} processed successfully. Total: {len(processed_tickets)}")
+            
+            # Loop delay - scan every 2 minutes
+            time.sleep(120)
+
+        except KeyboardInterrupt:
+            logger.info("Stopping service...")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
