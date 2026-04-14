@@ -139,6 +139,13 @@ def find_text_location(image_path, target_text, offset_x=0, offset_y=0):
 def main():
     logger.info("Starting WeCom AutoReply Service (Refactored Version)...")
     
+    # ✅ 使用绝对路径，避免 nohup 启动时工作目录不一致导致截图写入失败
+    import os as _os
+    _BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
+    SCREENSHOT_VISION_PATH    = _os.path.join(_BASE_DIR, 'debug_current_vision.png')
+    SCREENSHOT_VERIFY_PATH    = _os.path.join(_BASE_DIR, 'debug_verify_chat.png')
+    SCREENSHOT_TICKET_PATH    = _os.path.join(_BASE_DIR, 'debug_ticket_capture.png')
+    
     # Initialize components
     monitor = WindowCapture(window_name="企业微信")
     vision = ImageProcessor()  # Text-based detection, no templates needed
@@ -146,6 +153,36 @@ def main():
     
     # State: Deduplication Set
     processed_tickets = set()
+    
+    # 鼠标守护基准坐标: 点击进入聊天前记录, 后续步骤检查是否有用户操作
+    mouse_guard_pos = None
+    MOUSE_MOVE_THRESHOLD = 50  # 像素: 超过此值视为用户正在操作鼠标
+    
+    def update_mouse_guard():
+        """更新鼠标守护基准为当前鼠标位置"""
+        nonlocal mouse_guard_pos
+        _p = pyautogui.position()
+        mouse_guard_pos = (_p.x, _p.y)
+    
+    def script_click(x, y, pause=0.3):
+        """程序点击: 执行点击后自动更新鼠标守护基准,避免误判"""
+        nonlocal mouse_guard_pos
+        pyautogui.click(x, y)
+        time.sleep(pause)  # 等鼠标停稳
+        _p = pyautogui.position()
+        mouse_guard_pos = (_p.x, _p.y)  # 更新基准为点击后的新位置
+    
+    def user_is_using_mouse():
+        """检测用户是否在移动鼠标 (相比守护基准坐标)"""
+        if mouse_guard_pos is None:
+            return False
+        cur = pyautogui.position()
+        dx = abs(cur.x - mouse_guard_pos[0])
+        dy = abs(cur.y - mouse_guard_pos[1])
+        moved = dx > MOUSE_MOVE_THRESHOLD or dy > MOUSE_MOVE_THRESHOLD
+        if moved:
+            logger.info(f"🖱️ 检测到鼠标移动 ({mouse_guard_pos} → {cur.x},{cur.y}), 终止本次自动处理")
+        return moved
     
     # Click cooldown to prevent duplicate clicks
     last_click_time = 0
@@ -194,6 +231,10 @@ def main():
     # Chat keywords for verification (STEP 6)
     CHAT_KEYWORDS = ['消息', '通讯录', '刚刚', '分钟前', '小时前']
     
+    # 每日重启：记录上次重启日期，避免同一天多次重启
+    import datetime
+    last_restart_date = None
+    
     # Main Loop
     while True:
         try:
@@ -202,10 +243,38 @@ def main():
                 logger.info(f"Monitor running... (Iteration {loop_count}) | Processed IDs: {len(processed_tickets)}")
 
             # ============================================================
+            # 每日凌晨5点自动重启企业微信 (清理遗留工单，防止电脑变卡)
+            # ============================================================
+            now = datetime.datetime.now()
+            today = now.date()
+            if now.hour == 13 and last_restart_date != today:
+                logger.info("=" * 60)
+                logger.info("🔄 每日13点自动重启企业微信...")
+                logger.info("=" * 60)
+                try:
+                    # 强制退出企业微信
+                    subprocess.run(['pkill', '-9', '-f', '企业微信'], timeout=5)
+                    logger.info("✅ 已关闭企业微信")
+                    time.sleep(3)
+                    # 重新打开企业微信
+                    subprocess.run(['open', '-a', '企业微信'], timeout=5)
+                    logger.info("✅ 已重新打开企业微信，等待启动...")
+                    time.sleep(15)  # 等待企业微信完全启动
+                    # 清空去重集合，避免隔天工单因历史记录被跳过
+                    processed_tickets.clear()
+                    last_click_time = 0
+                    last_restart_date = today
+                    logger.info("✅ 已重置状态，继续监控...")
+                except Exception as e:
+                    logger.error(f"重启企业微信失败: {e}")
+                    last_restart_date = today  # 即使失败也标记，避免反复重试
+                continue
+
+            # ============================================================
             # STEP 0: 被动截图检测IT服务工单状态
             # 查找"IT服务工单"聊天并检测红点状态
             # ============================================================
-            screenshot_path = "debug_current_vision.png"
+            screenshot_path = SCREENSHOT_VISION_PATH
             try:
                 # 截取企业微信窗口
                 window_id = monitor.find_window()
@@ -398,77 +467,52 @@ def main():
                 # 激活并点击
                 if bot.activate_window("企业微信"):
                     time.sleep(0.5)
-                    pyautogui.click(click_x, click_y)
-                    logger.info(f"✅ 已点击图标中心 ({click_x}, {click_y})")
+                    script_click(click_x, click_y)
+                    logger.info(f"✅ 已点击图标中心 ({click_x}, {click_y}), 🖱️ 守护基准已更新")
                     last_click_time = time.time()  # Set cooldown
-                    time.sleep(1)
+                    time.sleep(0.5)
 
             
             
             # ============================================================
-            # STEP 6: 验证是否在聊天列表(最多3次尝试)
+            # STEP 6: 点击后等待进入聊天 (已移除工作台检测,因关键词重叠导致误判)
             # ============================================================
             if should_process:
-                logger.info("验证是否在聊天列表...")
-                max_attempts = 3  # 最多3次尝试
-                in_chat_list = False
-                
-                for attempt in range(max_attempts):
-                    try:
-                        # 截取企微窗口
-                        verify_window_id = monitor.find_window()
-                        if verify_window_id:
-                            subprocess.run(['screencapture', '-x', '-l', str(verify_window_id), system_screenshot_path], 
-                                           check=True, timeout=3)
-                        else:
-                            in_chat_list = True
-                            break
-                        time.sleep(0.5)
-                        
-                        screenshot = cv2.imread(system_screenshot_path)
-                        if screenshot is not None:
-                            ocr_text = pytesseract.image_to_string(screenshot, lang='chi_sim')
-                            
-                            workbench_count = sum(1 for kw in WORKBENCH_KEYWORDS if kw in ocr_text)
-                            chat_count = sum(1 for kw in CHAT_KEYWORDS if kw in ocr_text)
-                            
-                            # 判断条件: 工作台关键词>=2 AND 聊天关键词<5
-                            is_on_workbench = workbench_count >= 2 and chat_count < 5
-                            
-                            if is_on_workbench:
-                                logger.info(f"检测到工作台页面 - 尝试 {attempt + 1}/{max_attempts} [工作台:{workbench_count}, 聊天:{chat_count}]")
-                                # 执行 Cmd+W 关闭
-                                bot.activate_window("企业微信")
-                                time.sleep(0.3)
-                                safe_hotkey('command', 'w')
-                                time.sleep(1.0)
-                            else:
-                                logger.info(f"✓ 已在聊天列表 (尝试 {attempt + 1}/{max_attempts}) [工作台:{workbench_count}, 聊天:{chat_count}]")
-                                in_chat_list = True
-                                break
-                    except Exception as e:
-                        logger.warning(f"验证失败: {e}")
-                        in_chat_list = True
-                        break
-                
-                if not in_chat_list:
-                    logger.warning("验证失败 - 无法回到聊天列表")
-                    # 设置冷却期防止快速重复点击
+                # 🖱️ 检查用户是否在使用鼠标
+                if user_is_using_mouse():
                     last_click_time = time.time()
-                    logger.info("已设置冷却期,等待下一次尝试")
+                    mouse_guard_pos = None
                     continue
+                
+                logger.info("等待进入聊天...")
+                time.sleep(1.0)  # 给界面切换一点时间
                 
                 # ============================================================
                 # 验证当前聊天是否为IT服务工单
                 # ============================================================
                 logger.info("验证当前聊天...")
                 time.sleep(0.5)
-                subprocess.run(['screencapture', '-x', 'debug_verify_chat.png'], check=True, timeout=2)
-                verify_screenshot = cv2.imread('debug_verify_chat.png')
+                try:
+                    verify_window_id = monitor.find_window()
+                    if verify_window_id:
+                        subprocess.run(['screencapture', '-x', '-l', str(verify_window_id), SCREENSHOT_VERIFY_PATH],
+                                       check=True, timeout=3)
+                    else:
+                        subprocess.run(['screencapture', '-x', SCREENSHOT_VERIFY_PATH], check=True, timeout=2)
+                except Exception as e:
+                    logger.warning(f"聊天验证截图失败: {e}, 直接继续处理")
+                    verify_screenshot = None
+                else:
+                    verify_screenshot = cv2.imread(SCREENSHOT_VERIFY_PATH)
+                
                 if verify_screenshot is not None:
                     verify_text = pytesseract.image_to_string(verify_screenshot, lang='chi_sim')
-                    if 'IT服务工单' not in verify_text and '宝冶IT服务系统' not in verify_text:
-                        logger.warning("⚠️ 当前不是IT服务工单聊天!")
+                    # OCR 经常将 "IT" 识别为 "上T"，所以同时检测两种写法
+                    IT_KEYWORDS = ['IT服务工单', '上T服务工单', '宝冶IT服务系统', '宝冶上T服务系统',
+                                   '宝冶IT', '上T服务系统', 'IT服务系统']
+                    found = any(kw in verify_text for kw in IT_KEYWORDS)
+                    if not found:
+                        logger.warning(f"⚠️ 当前不是IT服务工单聊天! OCR片段: {verify_text[:100].replace(chr(10),' ')}")
                         logger.warning("⚠️ 跳过处理,设置冷却期")
                         last_click_time = time.time()
                         continue
@@ -498,7 +542,7 @@ def main():
                 chat_click_x = int(win_x + win_w * 0.80)  # 调整到80%位置
                 chat_click_y = int(win_y + win_h * 0.5)
                 logger.info(f"点击聊天内容坐标: ({chat_click_x}, {chat_click_y}) [窗口80%位置]")
-                pyautogui.click(chat_click_x, chat_click_y)
+                script_click(chat_click_x, chat_click_y)
                 time.sleep(0.3)
                 
                 # 滚动到最新消息 - 只使用End键
@@ -509,6 +553,12 @@ def main():
                 # ============================================================
                 # 抓取最新工单信息 - 只截取企微聊天内容区域
                 # ============================================================
+                # 🖱️ 截图前再检查一次鼠标
+                if user_is_using_mouse():
+                    last_click_time = time.time()
+                    mouse_guard_pos = None
+                    continue
+                
                 logger.info("=" * 60)
                 logger.info("📋 正在抓取最新工单信息...")
                 
@@ -524,17 +574,27 @@ def main():
                 
                 # 删除旧截图文件避免写入冲突
                 import os
-                if os.path.exists('debug_ticket_capture.png'):
-                    os.remove('debug_ticket_capture.png')
+                if _os.path.exists(SCREENSHOT_TICKET_PATH):
+                    _os.remove(SCREENSHOT_TICKET_PATH)
                 
                 # 使用 screencapture -R x,y,w,h 只截取指定区域
-                subprocess.run([
-                    'screencapture', '-x', '-R', 
-                    f'{content_x},{content_y},{content_w},{content_h}',
-                    'debug_ticket_capture.png'
-                ], check=True, timeout=2)
-                time.sleep(0.3)
-                ticket_screenshot = cv2.imread('debug_ticket_capture.png')
+                try:
+                    result = subprocess.run(
+                        ['screencapture', '-x', '-R', 
+                         f'{content_x},{content_y},{content_w},{content_h}',
+                         SCREENSHOT_TICKET_PATH],
+                        check=True, timeout=5, capture_output=True, text=True
+                    )
+                    time.sleep(0.3)
+                    ticket_screenshot = cv2.imread(SCREENSHOT_TICKET_PATH)
+                    if ticket_screenshot is None:
+                        logger.error(f"❌ 截图文件读取失败: {SCREENSHOT_TICKET_PATH} 不存在或为空")
+                        last_click_time = time.time()
+                        continue
+                except Exception as e:
+                    logger.error(f"❌ 工单截图失败: {e}")
+                    last_click_time = time.time()
+                    continue
                 
                 if ticket_screenshot is not None:
                     full_text = pytesseract.image_to_string(ticket_screenshot, lang='chi_sim')
@@ -544,13 +604,17 @@ def main():
                     
                     import re
                     
-                    # ========================================
-                    # 识别工单格式 - 选择最新的工单
-                    # ========================================
-                    ticket_id = None
-                    ticket_type = None
+                    # ⚠️ OCR经常将"查看详情"拆成"查"和"看详情"两行
+                    # 使用去掉空白的压缩文本来检测，避免误判
+                    full_text_compact = re.sub(r'\s+', '', full_text)
+                    has_view_detail = '查看详情' in full_text_compact or '查看详情' in full_text
+                    logger.info(f"包含'查看详情': {has_view_detail}")
                     
-                    # 使用findall获取所有匹配,选择最后一个(最新)
+                    # ========================================
+                    # 识别工单格式 - 汇总所有候选工单
+                    # ========================================
+                    
+                    # 使用findall获取所有匹配
                     # 格式1: [人名] 添加了 [数字ID] - 新工单
                     pattern1 = r'(\w+)\s*添加了\s*(\d{5,})'
                     matches1 = re.findall(pattern1, full_text)
@@ -565,100 +629,131 @@ def main():
                     if matches2:
                         logger.info(f"检测到工单提醒: {matches2}")
                     
-                    # 优先选择新工单格式,如果没有则选择工单提醒格式
-                    if matches1:
-                        person_name, ticket_id = matches1[-1]  # 选择最后一个(最新)
-                        ticket_type = f"新工单(由{person_name}添加)"
-                        logger.info(f"选择最新的新工单: ID={ticket_id}, 添加人={person_name}")
-                    elif matches2:
-                        ticket_id = matches2[-1]  # 选择最后一个(最新)
-                        ticket_type = "工单提醒"
-                        logger.info(f"选择最新的工单提醒: ID={ticket_id}")
+                    # 汇总所有候选工单(去重,保持顺序)
+                    # 新工单优先,然后是提醒工单
+                    # ⚠️ 去重key格式: "{ticket_id}_new" 或 "{ticket_id}_reminder"
+                    # 这样同一工单的不同类型消息可以独立处理，不互相干扰
+                    all_candidates = []
+                    seen_dedup_keys = set()
+                    for person_name, tid in matches1:
+                        dedup_key = f"{tid}_new"
+                        if dedup_key not in seen_dedup_keys:
+                            seen_dedup_keys.add(dedup_key)
+                            all_candidates.append((tid, f"新工单(由{person_name}添加)", dedup_key))
+                    for tid in matches2:
+                        dedup_key = f"{tid}_reminder"
+                        if dedup_key not in seen_dedup_keys:
+                            seen_dedup_keys.add(dedup_key)
+                            all_candidates.append((tid, "工单提醒", dedup_key))
+                    
+                    logger.info(f"所有候选工单: {[(t[0], t[1]) for t in all_candidates]}")
                     
                     # ========================================
-                    # 去重检查:避免重复处理同一工单
+                    # 遍历候选工单,找到第一个未处理的
                     # ========================================
-                    if ticket_id and '查看详情' in full_text:
-                        if ticket_id not in processed_tickets:
-                            # 记录工单并处理
-                            processed_tickets.add(ticket_id)
-                            logger.info(f"✅ 检测到新消息: {ticket_type} (ID: {ticket_id})")
-                            logger.info("=" * 40)
-                            logger.info("开始处理工单...")
-                            
-                            # ========================================
-                            # 点击"查看详情"按钮 → 跳转到工单系统
-                            # 使用OCR边界框定位精确点击
-                            # ========================================
-                            logger.info("🔗 步骤1: 使用OCR边界框定位'查看详情'按钮...")
-                            
-                            # 使用之前截取的聊天内容区域图片进行定位
-                            # content_x, content_y 是截图区域的屏幕偏移量
-                            view_detail_pos = find_text_location(
-                                'debug_ticket_capture.png', 
-                                '查看详情',
-                                offset_x=content_x,
-                                offset_y=content_y
-                            )
-                            
-                            if view_detail_pos:
-                                link_x, link_y = view_detail_pos
-                                logger.info(f"✅ OCR定位成功,点击坐标: ({link_x}, {link_y})")
-                                pyautogui.click(link_x, link_y)
+                    ticket_id = None
+                    ticket_type = None
+                    ticket_dedup_key = None
+                    
+                    if all_candidates and has_view_detail:
+                        for cand_id, cand_type, cand_key in all_candidates:
+                            if cand_key not in processed_tickets:
+                                ticket_id = cand_id
+                                ticket_type = cand_type
+                                ticket_dedup_key = cand_key
+                                logger.info(f"✅ 选中未处理工单: ID={ticket_id}, 类型={ticket_type}")
+                                break
                             else:
-                                # 如果OCR定位失败,使用备用固定坐标
-                                logger.warning("⚠️ OCR定位失败,使用备用固定坐标...")
-                                link_x = int(win_x + win_w * 0.75)
-                                link_y = int(win_y + win_h * 0.70)
-                                logger.info(f"备用点击坐标: ({link_x}, {link_y}) [窗口75%, 70%]")
-                                pyautogui.click(link_x, link_y)
-                            
-                            # 等待10秒让工单系统加载
-                            logger.info("⏳ 等待10秒让工单系统加载...")
-                            time.sleep(10)
-                            
-                            # 回复"稍等"
-                            logger.info("📝 回复'稍等'...")
-                            import pyperclip
-                            
-                            # 复制到剪贴板
-                            pyperclip.copy('稍等')
-                            logger.info(f"   剪贴板: '{pyperclip.paste()}'")
-                            
-                            # 点击输入框获取焦点
-                            screen_width, screen_height = pyautogui.size()
-                            input_x = int(screen_width * 0.80)
-                            input_y = int(screen_height * 0.77)
-                            logger.info(f"   点击输入框: ({input_x}, {input_y})")
-                            pyautogui.click(input_x, input_y)
-                            time.sleep(0.5)
-                            
-                            # 粘贴 - 使用AppleScript确保Cmd+V可靠执行
-                            logger.info("   粘贴 Cmd+V (AppleScript)...")
-                            subprocess.run(['osascript', '-e', 
-                                'tell application "System Events" to keystroke "v" using command down'],
-                                timeout=3)
-                            time.sleep(2)
-                            
-                            # 发送 - 使用AppleScript确保Enter可靠执行
-                            logger.info("   发送 Enter (AppleScript)...")
-                            subprocess.run(['osascript', '-e',
-                                'tell application "System Events" to key code 36'],
-                                timeout=3)
-                            time.sleep(2)
-                            
-                            # 退出工单系统
-                            logger.info("   退出 Escape...")
-                            pyautogui.press('escape')
-                            time.sleep(0.5)
-                            logger.info("✅ 已回复'稍等'并退出工单")
-                            
-                            # 设置冷却期防止重复处理
+                                logger.info(f"⏭️ 工单 {cand_id}({cand_type}) 已处理,检查下一个...")
+                    
+                    if ticket_id and has_view_detail:
+                        # 记录工单并处理
+                        processed_tickets.add(ticket_dedup_key)  # 用组合key去重
+                        logger.info(f"✅ 检测到新消息: {ticket_type} (ID: {ticket_id})")
+                        logger.info("=" * 40)
+                        logger.info("开始处理工单...")
+                        
+                        # 🖱️ 点击查看详情前最后检查一次鼠标
+                        if user_is_using_mouse():
+                            # 已加入processed_tickets，避免重复处理需回退
+                            processed_tickets.discard(ticket_dedup_key)
                             last_click_time = time.time()
-                            logger.info("✅ 已设置冷却期,防止重复处理")
+                            mouse_guard_pos = None
+                            break
+                        
+                        # ========================================
+                        # 点击"查看详情"按钮 → 跳转到工单系统
+                        # 使用OCR边界框定位精确点击
+                        # ========================================
+                        logger.info("🔗 步骤1: 使用OCR边界框定位'查看详情'按钮...")
+                        
+                        # 使用之前截取的聊天内容区域图片进行定位
+                        # content_x, content_y 是截图区域的屏幕偏移量
+                        view_detail_pos = find_text_location(
+                            SCREENSHOT_TICKET_PATH, 
+                            '查看详情',
+                            offset_x=content_x,
+                            offset_y=content_y
+                        )
+                        
+                        if view_detail_pos:
+                            link_x, link_y = view_detail_pos
+                            logger.info(f"✅ OCR定位成功,点击坐标: ({link_x}, {link_y})")
+                            script_click(link_x, link_y)
                         else:
-                            # 工单已处理过,跳过
-                            logger.info(f"⏭️ 工单 {ticket_id} 已处理,跳过")
+                            # 如果OCR定位失败,使用备用固定坐标
+                            logger.warning("⚠️ OCR定位失败,使用备用固定坐标...")
+                            link_x = int(win_x + win_w * 0.75)
+                            link_y = int(win_y + win_h * 0.70)
+                            logger.info(f"备用点击坐标: ({link_x}, {link_y}) [窗口75%, 70%]")
+                            script_click(link_x, link_y)
+                        
+                        # 等待10秒让工单系统加载
+                        logger.info("⏳ 等待10秒让工单系统加载...")
+                        time.sleep(10)
+                        
+                        # 回复"稍等"
+                        logger.info("📝 回复'稍等'...")
+                        import pyperclip
+                        
+                        # 复制到剪贴板
+                        pyperclip.copy('稍等')
+                        logger.info(f"   剪贴板: '{pyperclip.paste()}'")
+                        
+                        # 点击输入框获取焦点
+                        screen_width, screen_height = pyautogui.size()
+                        input_x = int(screen_width * 0.80)
+                        input_y = int(screen_height * 0.77)
+                        logger.info(f"   点击输入框: ({input_x}, {input_y})")
+                        script_click(input_x, input_y)
+                        time.sleep(0.5)
+                        
+                        # 粘贴 - 使用AppleScript确保Cmd+V可靠执行
+                        logger.info("   粘贴 Cmd+V (AppleScript)...")
+                        subprocess.run(['osascript', '-e', 
+                            'tell application "System Events" to keystroke "v" using command down'],
+                            timeout=3)
+                        time.sleep(2)
+                        
+                        # 发送 - 使用AppleScript确保Enter可靠执行
+                        logger.info("   发送 Enter (AppleScript)...")
+                        subprocess.run(['osascript', '-e',
+                            'tell application "System Events" to key code 36'],
+                            timeout=3)
+                        time.sleep(2)
+                        
+                        # 退出工单系统
+                        logger.info("   退出 Escape...")
+                        pyautogui.press('escape')
+                        time.sleep(0.5)
+                        logger.info("✅ 已回复'稍等'并退出工单")
+                        
+                        # 设置冷却期防止重复处理
+                        last_click_time = time.time()
+                        logger.info("✅ 已设置冷却期,防止重复处理")
+                    elif all_candidates and all(ckey in processed_tickets for _, _, ckey in all_candidates):
+                        # 所有候选工单都已处理
+                        logger.info(f"⏭️ 所有候选工单均已处理,跳过")
                     else:
                         # 未匹配到有效工单格式
                         logger.warning("❌ 未匹配到有效工单格式 (需要: [人名]添加了[ID] 或 工单[ID])")
